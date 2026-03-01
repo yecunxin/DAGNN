@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from model import AsymmetricDecoupleEncoder, Classifier
-from utils import evaluate, CitationDataset, TwitchDataset, batch_hsic, compute_ppr_matrix, compute_tmmd, scaled_cosine_loss, adj_bce_loss
+from utils import evaluate, CitationDataset, TwitchDataset, batch_hsic, compute_ppr_matrix, compute_tmmd, feature_l2_recon_loss， scaled_cosine_loss, adj_bce_loss
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=100)
@@ -83,6 +83,7 @@ def train():
         hsic_t = batch_hsic(z_private_t, z_shared_t, batch_size=args.hsic_batch_size)
         loss_diff = hsic_s + hsic_t
 
+        # loss_rec_s = feature_l2_recon_loss(source_data.x, x_recon_s)
         loss_rec_s = scaled_cosine_loss(source_data.x, x_recon_s)
         loss_rec_t = adj_bce_loss(adj_t, adj_recon_t)
         loss_rec = loss_rec_t + 0.5 * loss_rec_s
