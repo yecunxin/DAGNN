@@ -1,153 +1,110 @@
-import time
-import glob
 import argparse
 import itertools
-import os
 import os.path as osp
 import numpy as np
-
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import f1_score
-
-from model import Encoder, Classifier
-from utils import evaluate, CitationDataset, TwitchDataset, structure_aware_regularization, SMMD, get_katz_weight, compute_similarity
+from model import AsymmetricDecoupleEncoder, Classifier
+from utils import evaluate, CitationDataset, TwitchDataset, batch_hsic, compute_ppr_matrix, compute_tmmd, scaled_cosine_loss, adj_bce_loss
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--seed', type=int, default=42,
-                    help='random seed')
-parser.add_argument('--lr', type=float, default=0.005,
-                    help='learning rate')
-parser.add_argument('--weight_decay', type=float, default=0.005,
-                    help='weight decay')
-parser.add_argument('--dropout_ratio', type=float, default=0.5,
-                    help='dropout ratio')
-parser.add_argument('--nhid', type=int, default=64,
-                    help='hidden size')
-parser.add_argument('--patience', type=int, default=100,
-                    help='patience for early stopping')
-parser.add_argument('--device', type=str, default='cuda',
-                    help='specify cuda devices')
-parser.add_argument('--run_times', type=int, default=1,
-                    help='run times')
-parser.add_argument('--epochs', type=int, default=200,
-                    help='maximum number of epochs')
-parser.add_argument('--source', type=str, default='DBLPv7',
-                    help='source domain data')
-parser.add_argument('--target', type=str, default='Citationv1',
-                    help='target domain data')
-parser.add_argument('--source_pnum', type=int, default=0,
-                    help='the number of propagation layers on the source graph')
-parser.add_argument('--target_pnum', type=int, default=10,
-                    help='the number of propagation layers on the target graph')
+parser.add_argument('--seed', type=int, default=100)
+parser.add_argument('--lr', type=float, default=0.005)
+parser.add_argument('--weight_decay', type=float, default=0.0005)
+parser.add_argument('--dropout_ratio', type=float, default=0.5)
+parser.add_argument('--nhid', type=int, default=128)
+parser.add_argument('--epochs', type=int, default=200)
+parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--run_times', type=int, default=10)
+parser.add_argument('--source', type=str, default='DBLPv7')
+parser.add_argument('--target', type=str, default='Citationv1')
+parser.add_argument('--source_pnum', type=int, default=0)
+parser.add_argument('--target_pnum', type=int, default=10)
+parser.add_argument('--lambda1', type=float, default=0.5)
+parser.add_argument('--lambda2', type=float, default=1e-4)
+parser.add_argument('--lambda3', type=float, default=0.1)
+parser.add_argument('--ppr_alpha', type=float, default=0.1)
+parser.add_argument('--hsic_batch_size', type=int, default=256)
 args = parser.parse_args()
-print(args)
 
 if args.source in {'DBLPv7', 'ACMv9', 'Citationv1'}:
-    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data',
-                    args.source)
+    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data', args.source)
     source_dataset = CitationDataset(path, args.source)
 if args.source in {'EN', 'DE'}:
-    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data',
-                    args.source)
+    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data', args.source)
     source_dataset = TwitchDataset(path, args.source)
 if args.target in {'DBLPv7', 'ACMv9', 'Citationv1'}:
-    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data',
-                    args.target)
+    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data', args.target)
     target_dataset = CitationDataset(path, args.target)
 if args.target in {'EN', 'DE'}:
-    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data',
-                    args.target)
+    path = osp.join(osp.dirname(osp.realpath(__file__)), './', 'data', args.target)
     target_dataset = TwitchDataset(path, args.target)
+
 source_data = source_dataset[0].to(args.device)
 target_data = target_dataset[0].to(args.device)
-
 args.num_classes = len(np.unique(source_dataset[0].y.numpy()))
 args.num_features = source_data.x.size(1)
-args.save_path = './'
 
+target_num_nodes = target_data.x.size(0)
+ppr_matrix = compute_ppr_matrix(target_data.edge_index, target_num_nodes, alpha=args.ppr_alpha).to(args.device)
 
-def train(args, source_data, target_data):
-    min_loss = 1e10
-    patience_cnt = 0
-    loss_values = []
-    best_epoch = 0
-    tau = 0.5
+adj_s = torch.zeros(source_data.x.size(0), source_data.x.size(0), device=args.device)
+adj_s[source_data.edge_index[0], source_data.edge_index[1]] = 1.0
+adj_t = torch.zeros(target_data.x.size(0), target_data.x.size(0), device=args.device)
+adj_t[target_data.edge_index[0], target_data.edge_index[1]] = 1.0
 
-    encoder = Encoder(args).to(args.device)
-
-    # 分类器
+def train():
+    encoder = AsymmetricDecoupleEncoder(args).to(args.device)
     cls = Classifier(args.nhid, args.num_classes).to(args.device)
-
     models = [encoder, cls]
     params = itertools.chain(*[model.parameters() for model in models])
+    optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    optimizer = torch.optim.Adam(params, lr=args.lr,
-                                 weight_decay=args.weight_decay)
-
-    t = time.time()
-    for model in models:
-        model.train()
-
+    best_acc = 0.0
     for epoch in range(args.epochs):
-        correct = 0
+        for model in models:
+            model.train()
+        optimizer.zero_grad()
 
-        # Source Domain Cross-Entropy Loss
-
-        x_s = encoder(source_data.x, source_data.edge_index, args.source_pnum)
-
-        output = cls(x_s, source_data.edge_index)
-
-        train_loss = F.nll_loss(F.log_softmax(output / tau, dim=1), source_data.y)
-        loss = train_loss
-
-        # SMMD Loss
-
-        x_t = encoder(target_data.x, target_data.edge_index, args.target_pnum)
-
-        beta = 0.5  # 可调超参数（建议范围：0.01~0.5，需实验调优）
-        katz_weight_t = get_katz_weight(
-            target_data,  # 目标域数据集（与 PPR 一致）
-            beta=beta,
-            method="series"  # 优先矩阵求逆，失败自动切换级数求和
+        z_private_s, z_shared_s, x_recon_s = encoder(
+            source_data.x, source_data.edge_index,
+            conv_time=args.source_pnum, is_source=True
         )
 
-        smmd_loss = SMMD(x_s, x_t, katz_weight_t)
+        z_private_t, z_shared_t, x_recon_t, adj_recon_t = encoder(
+            target_data.x, target_data.edge_index,
+            conv_time=args.target_pnum, is_source=False
+        )
 
-        str_loss = structure_aware_regularization(x_t, compute_similarity(x_t))
+        output = cls(z_shared_s)
+        loss_cls = F.nll_loss(F.log_softmax(output, dim=1), source_data.y)
 
-        # Overall Loss
-        loss = 1 * loss + 0.5 * smmd_loss + 0.5 * str_loss
+        hsic_s = batch_hsic(z_private_s, z_shared_s, batch_size=args.hsic_batch_size)
+        hsic_t = batch_hsic(z_private_t, z_shared_t, batch_size=args.hsic_batch_size)
+        loss_diff = hsic_s + hsic_t
 
-        optimizer.zero_grad()
+        loss_rec_s = scaled_cosine_loss(source_data.x, x_recon_s)
+        loss_rec_t = adj_bce_loss(adj_t, adj_recon_t)
+        loss_rec = loss_rec_t + 0.5 * loss_rec_s
+
+        loss_tmmd = compute_tmmd(z_shared_s, z_shared_t, ppr_matrix)
+
+        loss = loss_cls + args.lambda1 * loss_tmmd + args.lambda2 * loss_diff + args.lambda3 * loss_rec
+
         loss.backward()
         optimizer.step()
 
-        for model in models:
-            model.eval()
-        with torch.no_grad():
-            # acc, _, _, _ = evaluate(source_data, model)
-            # _, macro_f1, micro_f1, test_loss = evaluate(target_data, models,
-            #                                             args.target_pnum)
+        acc, macro_f1, micro_f1 = evaluate(target_data, encoder, cls, conv_time=args.target_pnum, is_source=False)
+        if acc > best_acc:
+            best_acc = acc
+        print(f'Epoch: {epoch+1:04d} | Loss: {loss.item():.6f} | Target Acc: {acc:.4f} | Best Acc: {best_acc:.4f}')
 
-            output_t = cls(x_t, target_data.edge_index)
-            output_t = F.log_softmax(output_t, dim=1)
-            loss = F.nll_loss(output_t / tau, target_data.y)
-            pred = output_t.max(dim=1)[1]
+    return best_acc
 
-            correct = pred.eq(target_data.y).sum().item()
-            acc = correct * 1.0 / len(target_data.y)
-
-            pred = pred.cpu().numpy()
-            gt = target_data.y.cpu().numpy()
-            macro_f1 = f1_score(gt, pred, average='macro')
-            micro_f1 = f1_score(gt, pred, average='micro')
-
-            print('Epoch: {:04d}'.format(epoch + 1),
-                  'train_loss: {:.6f}'.format(loss),
-                  # 'test_loss: {:.6f}'.format(test_loss),
-                  'test_acc: {:.6f}'.format(acc),
-                  'macro_f1: {:.6f}'.format(macro_f1),
-                  'micro_f1: {:.6f}'.format(micro_f1))
-
-train(args, source_data, target_data)
+if __name__ == '__main__':
+    acc_list = []
+    for run in range(args.run_times):
+        print(f'\n===== Run {run+1}/{args.run_times} =====')
+        run_acc = train()
+        acc_list.append(run_acc)
+    print(f'\nFinal Result: Mean Acc = {np.mean(acc_list):.4f} ± {np.std(acc_list):.4f}')
