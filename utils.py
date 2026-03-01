@@ -152,6 +152,13 @@ def compute_tmmd(source_feat, target_feat, ppr_matrix, sampling_num=1000, times=
     return tmmd_total / times
 
 
+
+def feature_l2_recon_loss(x_origin, x_recon):
+    feature_diff = x_origin - x_recon
+    node_l2_norms = torch.norm(feature_diff, p=2, dim=1)
+    loss = torch.mean(node_l2_norms)
+    return loss
+
 def scaled_cosine_loss(x_origin, x_recon):
     x_origin_norm = F.normalize(x_origin, p=2, dim=1)
     x_recon_norm = F.normalize(x_recon, p=2, dim=1)
